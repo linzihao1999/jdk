@@ -37,9 +37,11 @@ import com.sun.source.tree.MemberReferenceTree.ReferenceMode;
 import com.sun.source.tree.ModuleTree.ModuleKind;
 
 import com.sun.tools.javac.code.*;
+import com.sun.tools.javac.code.FlagsEnum;
 import com.sun.tools.javac.code.Source.Feature;
 import com.sun.tools.javac.file.PathFileObject;
 import com.sun.tools.javac.parser.Tokens.*;
+import com.sun.tools.javac.parser.Tokens.Comment.CommentStyle;
 import com.sun.tools.javac.resources.CompilerProperties.Errors;
 import com.sun.tools.javac.resources.CompilerProperties.Fragments;
 import com.sun.tools.javac.resources.CompilerProperties.LintWarnings;
@@ -52,6 +54,7 @@ import com.sun.tools.javac.util.JCDiagnostic.Error;
 import com.sun.tools.javac.util.JCDiagnostic.Fragment;
 import com.sun.tools.javac.util.List;
 
+import static com.sun.tools.javac.code.Flags.asFlagSet;
 import static com.sun.tools.javac.parser.Tokens.TokenKind.*;
 import static com.sun.tools.javac.parser.Tokens.TokenKind.ASSERT;
 import static com.sun.tools.javac.parser.Tokens.TokenKind.CASE;
@@ -60,6 +63,7 @@ import static com.sun.tools.javac.parser.Tokens.TokenKind.EQ;
 import static com.sun.tools.javac.parser.Tokens.TokenKind.GT;
 import static com.sun.tools.javac.parser.Tokens.TokenKind.IMPORT;
 import static com.sun.tools.javac.parser.Tokens.TokenKind.LT;
+import static com.sun.tools.javac.parser.Tokens.TokenKind.SYNCHRONIZED;
 import com.sun.tools.javac.parser.VirtualParser.VirtualScanner;
 import static com.sun.tools.javac.tree.JCTree.Tag.*;
 import static com.sun.tools.javac.resources.CompilerProperties.Fragments.ImplicitAndExplicitNotAllowed;
@@ -194,6 +198,7 @@ public class JavacParser implements Parser {
         this.allowYieldStatement = Feature.SWITCH_EXPRESSION.allowedInSource(source);
         this.allowRecords = Feature.RECORDS.allowedInSource(source);
         this.allowSealedTypes = Feature.SEALED_CLASSES.allowedInSource(source);
+        this.allowValueClasses = preview.isEnabled() && Feature.VALUE_CLASSES.allowedInSource(source);
         updateUnexpectedTopLevelDefinitionStartError(false);
     }
 
@@ -217,6 +222,7 @@ public class JavacParser implements Parser {
         this.allowYieldStatement = Feature.SWITCH_EXPRESSION.allowedInSource(source);
         this.allowRecords = Feature.RECORDS.allowedInSource(source);
         this.allowSealedTypes = Feature.SEALED_CLASSES.allowedInSource(source);
+        this.allowValueClasses = preview.isEnabled() && Feature.VALUE_CLASSES.allowedInSource(source);
         updateUnexpectedTopLevelDefinitionStartError(false);
     }
 
@@ -248,6 +254,10 @@ public class JavacParser implements Parser {
     /** Switch: are records allowed in this source level?
      */
     boolean allowRecords;
+
+    /** Switch: are value classes allowed in this source level?
+     */
+    boolean allowValueClasses;
 
     /** Switch: are sealed types allowed in this source level?
      */
@@ -772,7 +782,7 @@ public class JavacParser implements Parser {
             }
         } else if (token.kind == UNDERSCORE) {
             if (Feature.UNDERSCORE_IDENTIFIER.allowedInSource(source)) {
-                log.warning(token.pos, Warnings.UnderscoreAsIdentifier);
+                log.warning(DiagnosticFlag.SYNTAX, token.pos, Warnings.UnderscoreAsIdentifier);
             } else if (asVariable) {
                 checkSourceLevel(Feature.UNNAMED_VARIABLES);
                 if (peekToken(LBRACKET)) {
@@ -972,6 +982,9 @@ public class JavacParser implements Parser {
         mods = mods != null ? mods : optFinal(0);
         JCExpression e;
         if (token.kind == UNDERSCORE && parsedType == null) {
+            if (!allowVar && Feature.UNNAMED_VARIABLES.allowedInSource(source)){
+                log.error(DiagnosticFlag.SYNTAX, token.pos, Errors.UseOfUnderscoreNotAllowedNonVariable);
+            }
             nextToken();
             checkSourceLevel(Feature.UNNAMED_VARIABLES);
             pattern = toP(F.at(token.pos).AnyPattern());
@@ -1080,10 +1093,10 @@ public class JavacParser implements Parser {
 
     public JCExpression unannotatedType(boolean allowVar, int newmode) {
         JCExpression result = term(newmode);
-        Name restrictedTypeName = restrictedTypeName(result, !allowVar);
+        JCIdent restrictedTypeTree = restrictedTypeName(result, !allowVar);
 
-        if (restrictedTypeName != null && (!allowVar || restrictedTypeName != names.var)) {
-            syntaxError(result.pos, Errors.RestrictedTypeNotAllowedHere(restrictedTypeName));
+        if (restrictedTypeTree != null && (!allowVar || restrictedTypeTree.name != names.var)) {
+            syntaxError(restrictedTypeTree.pos, Errors.RestrictedTypeNotAllowedHere(restrictedTypeTree.name));
         }
 
         if ((lastmode & TYPE) == 0) {
@@ -1636,8 +1649,10 @@ public class JavacParser implements Parser {
                         }
 
                         List<JCAnnotation> tyannos = null;
-                        if (isMode(TYPE) && token.kind == MONKEYS_AT) {
-                            tyannos = typeAnnotationsOpt();
+                        if (token.kind == MONKEYS_AT) {
+                            if (isMode(TYPE) || isParameterizedTypePrefix()) {
+                                tyannos = typeAnnotationsOpt();
+                            }
                         }
                         // typeArgs saved for next loop iteration.
                         t = toP(F.at(pos).Select(t, ident()));
@@ -1662,7 +1677,7 @@ public class JavacParser implements Parser {
                         }
                         break loop;
                     case LT:
-                        if (!isMode(TYPE) && isUnboundMemberRef()) {
+                        if (!isMode(TYPE) && isParameterizedTypePrefix()) {
                             //this is an unbound method reference whose qualifier
                             //is a generic type i.e. A<S>::m
                             int pos1 = token.pos;
@@ -1678,7 +1693,14 @@ public class JavacParser implements Parser {
                             while (token.kind == DOT) {
                                 nextToken();
                                 selectTypeMode();
+                                tyannos = null;
+                                if (token.kind == MONKEYS_AT) {
+                                    tyannos = typeAnnotationsOpt();
+                                }
                                 t = toP(F.at(token.pos).Select(t, ident()));
+                                if (tyannos != null && tyannos.nonEmpty()) {
+                                    t = toP(F.at(tyannos.head.pos).AnnotatedType(tyannos, t));
+                                }
                                 t = typeApplyOpt(t);
                             }
                             t = bracketsOpt(t);
@@ -1908,7 +1930,7 @@ public class JavacParser implements Parser {
      * matching '&gt;' and see if the subsequent terminal is either '.' or '::'.
      */
     @SuppressWarnings("fallthrough")
-    boolean isUnboundMemberRef() {
+    boolean isParameterizedTypePrefix() {
         int pos = 0, depth = 0;
         outer: for (Token t = S.token(pos) ; ; t = S.token(++pos)) {
             switch (t.kind) {
@@ -1916,28 +1938,10 @@ public class JavacParser implements Parser {
                 case DOT: case RBRACKET: case LBRACKET: case COMMA:
                 case BYTE: case SHORT: case INT: case LONG: case FLOAT:
                 case DOUBLE: case BOOLEAN: case CHAR:
-                case MONKEYS_AT:
                     break;
-
-                case LPAREN:
-                    // skip annotation values
-                    int nesting = 0;
-                    for (; ; pos++) {
-                        TokenKind tk2 = S.token(pos).kind;
-                        switch (tk2) {
-                            case EOF:
-                                return false;
-                            case LPAREN:
-                                nesting++;
-                                break;
-                            case RPAREN:
-                                nesting--;
-                                if (nesting == 0) {
-                                    continue outer;
-                                }
-                                break;
-                        }
-                    }
+                case MONKEYS_AT:
+                    pos = skipAnnotation(pos);
+                    break;
 
                 case LT:
                     depth++; break;
@@ -1948,13 +1952,21 @@ public class JavacParser implements Parser {
                 case GT:
                     depth--;
                     if (depth == 0) {
-                        TokenKind nextKind = S.token(pos + 1).kind;
+                        TokenKind nextKind = S.token(++pos).kind;
+                        while (nextKind == MONKEYS_AT) {
+                            pos = skipAnnotation(pos);
+                            nextKind = S.token(++pos).kind;
+                        }
                         return
                             nextKind == TokenKind.DOT ||
                             nextKind == TokenKind.LBRACKET ||
                             nextKind == TokenKind.COLCOL;
+                    } else if (depth < 0) {
+                        return false;
                     }
                     break;
+                case COLCOL:
+                    return depth == 0;
                 default:
                     return false;
             }
@@ -2152,13 +2164,14 @@ public class JavacParser implements Parser {
         if (explicitParams) {
             LambdaClassifier lambdaClassifier = new LambdaClassifier();
             for (JCVariableDecl param: params) {
-                Name restrictedTypeName;
+                JCIdent restrictedTypeTree;
                 if (param.vartype != null &&
-                        (restrictedTypeName = restrictedTypeName(param.vartype, false)) != null &&
-                        param.vartype.hasTag(TYPEARRAY)) {
+                        (restrictedTypeTree = restrictedTypeName(param.vartype, false)) != null &&
+                        skipAnnotatedType(param.vartype).hasTag(TYPEARRAY)) {
                     log.error(DiagnosticFlag.SYNTAX, param.pos,
                         Feature.VAR_SYNTAX_IMPLICIT_LAMBDAS.allowedInSource(source)
-                            ? Errors.RestrictedTypeNotAllowedArray(restrictedTypeName) : Errors.RestrictedTypeNotAllowedHere(restrictedTypeName));
+                            ? Errors.RestrictedTypeNotAllowedArray(restrictedTypeTree.name)
+                            : Errors.RestrictedTypeNotAllowedHere(restrictedTypeTree.name));
                 }
                 lambdaClassifier.addParameter(param);
                 if (lambdaClassifier.result() == LambdaParameterKind.ERROR) {
@@ -2180,6 +2193,10 @@ public class JavacParser implements Parser {
         return lambdaExpressionOrStatementRest(params, pos);
     }
 
+    private JCTree skipAnnotatedType(JCTree type) {
+        return type instanceof JCAnnotatedType at ? at.underlyingType
+                : type;
+    }
     enum LambdaParameterKind {
         VAR(0),
         EXPLICIT(1),
@@ -2339,7 +2356,7 @@ public class JavacParser implements Parser {
             if (allowYieldStatement) {
                 return true;
             } else {
-                log.warning(pos, Warnings.InvalidYield);
+                log.warning(DiagnosticFlag.SYNTAX, pos, Warnings.InvalidYield);
             }
         }
         return false;
@@ -3003,6 +3020,10 @@ public class JavacParser implements Parser {
                 }
             }
         }
+        if (isValueModifier(true)) {
+            dc = token.docComment();
+            return List.of(classOrRecordOrInterfaceOrEnumDeclaration(modifiersOpt(), dc));
+        }
         dc = token.docComment();
         if (isRecordStart() && allowRecords) {
             return List.of(recordDeclaration(F.at(pos).Modifiers(0), dc));
@@ -3434,9 +3455,17 @@ public class JavacParser implements Parser {
                 case GT:
                     typeDepth--;
                     if (typeDepth == 0 && !peekToken(lookahead, DOT)) {
-                         return peekToken(lookahead, LAX_IDENTIFIER) ||
-                                peekToken(lookahead, tk -> tk == LPAREN) ? PatternResult.PATTERN
-                                                                         : PatternResult.EXPRESSION;
+                         if (peekToken(lookahead, LAX_IDENTIFIER) ||
+                            peekToken(lookahead, tk -> tk == LPAREN)) {
+                             return PatternResult.PATTERN;
+                         }
+                         else if (peekToken(lookahead, LBRACKET) ||
+                                  peekToken(lookahead, MONKEYS_AT)) {
+                             break;
+                         }
+                         else {
+                             return PatternResult.EXPRESSION;
+                         }
                     } else if (typeDepth < 0) return PatternResult.EXPRESSION;
                     break;
                 case MONKEYS_AT:
@@ -3606,6 +3635,10 @@ public class JavacParser implements Parser {
                 if (isSealedClassStart(false)) {
                     checkSourceLevel(Feature.SEALED_CLASSES);
                     flag = Flags.SEALED;
+                    break;
+                }
+                if (isValueModifier(false)) {
+                    flag = Flags.VALUE_CLASS;
                     break;
                 }
                 break loop;
@@ -3817,7 +3850,7 @@ public class JavacParser implements Parser {
             if (restrictedTypeNameStartingAtSource(typeName, pos, !compound && localDecl) != null) {
                 if (typeName != names.var) {
                     reportSyntaxError(elemType.pos, Errors.RestrictedTypeNotAllowedHere(typeName));
-                } else if (type.hasTag(TYPEARRAY) && !compound) {
+                } else if (skipAnnotatedType(type).hasTag(TYPEARRAY) && !compound) {
                     //error - 'var' and arrays
                     reportSyntaxError(elemType.pos, Errors.RestrictedTypeNotAllowedArray(typeName));
                 } else {
@@ -3842,12 +3875,14 @@ public class JavacParser implements Parser {
         return varType;
     }
 
-    Name restrictedTypeName(JCExpression e, boolean shouldWarn) {
+    JCIdent restrictedTypeName(JCExpression e, boolean shouldWarn) {
         switch (e.getTag()) {
             case IDENT:
-                return restrictedTypeNameStartingAtSource(((JCIdent)e).name, e.pos, shouldWarn) != null ? ((JCIdent)e).name : null;
+                return restrictedTypeNameStartingAtSource(((JCIdent)e).name, e.pos, shouldWarn) != null ? (JCIdent)e : null;
             case TYPEARRAY:
                 return restrictedTypeName(((JCArrayTypeTree)e).elemtype, shouldWarn);
+            case ANNOTATED_TYPE:
+                return restrictedTypeName(((JCAnnotatedType)e).underlyingType, shouldWarn);
             default:
                 return null;
         }
@@ -3858,35 +3893,42 @@ public class JavacParser implements Parser {
             if (Feature.LOCAL_VARIABLE_TYPE_INFERENCE.allowedInSource(source)) {
                 return Source.JDK10;
             } else if (shouldWarn) {
-                log.warning(pos, Warnings.RestrictedTypeNotAllowed(name, Source.JDK10));
+                log.warning(DiagnosticFlag.SYNTAX, pos, Warnings.RestrictedTypeNotAllowed(name, Source.JDK10));
             }
         }
         if (name == names.yield) {
             if (allowYieldStatement) {
                 return Source.JDK14;
             } else if (shouldWarn) {
-                log.warning(pos, Warnings.RestrictedTypeNotAllowed(name, Source.JDK14));
+                log.warning(DiagnosticFlag.SYNTAX, pos, Warnings.RestrictedTypeNotAllowed(name, Source.JDK14));
             }
         }
         if (name == names.record) {
             if (allowRecords) {
                 return Source.JDK14;
             } else if (shouldWarn) {
-                log.warning(pos, Warnings.RestrictedTypeNotAllowedPreview(name, Source.JDK14));
+                log.warning(DiagnosticFlag.SYNTAX, pos, Warnings.RestrictedTypeNotAllowedPreview(name, Source.JDK14));
+            }
+        }
+        if (name == names.value) {
+            if (allowValueClasses) {
+                return Source.DEFAULT;
+            } else if (shouldWarn) {
+                log.warning(pos, Warnings.RestrictedTypeNotAllowedPreview(name, Source.DEFAULT));
             }
         }
         if (name == names.sealed) {
             if (allowSealedTypes) {
                 return Source.JDK15;
             } else if (shouldWarn) {
-                log.warning(pos, Warnings.RestrictedTypeNotAllowedPreview(name, Source.JDK15));
+                log.warning(DiagnosticFlag.SYNTAX, pos, Warnings.RestrictedTypeNotAllowedPreview(name, Source.JDK15));
             }
         }
         if (name == names.permits) {
             if (allowSealedTypes) {
                 return Source.JDK15;
             } else if (shouldWarn) {
-                log.warning(pos, Warnings.RestrictedTypeNotAllowedPreview(name, Source.JDK15));
+                log.warning(DiagnosticFlag.SYNTAX, pos, Warnings.RestrictedTypeNotAllowedPreview(name, Source.JDK15));
             }
         }
         return null;
@@ -4057,7 +4099,7 @@ public class JavacParser implements Parser {
                     if (source.compareTo(Source.JDK21) >= 0)
                         reportSyntaxError(semiList.first().pos, Errors.ExtraneousSemicolon);
                     else
-                        log.warning(semiList.first().pos, Warnings.ExtraneousSemicolon);
+                        log.warning(DiagnosticFlag.SYNTAX, semiList.first().pos, Warnings.ExtraneousSemicolon);
                 }
                 seenImport = true;
                 defs.append(importDeclaration());
@@ -4074,7 +4116,7 @@ public class JavacParser implements Parser {
                         if (source.compareTo(Source.JDK21) >= 0)
                             reportSyntaxError(semiList.first().pos, Errors.ExtraneousSemicolon);
                         else
-                            log.warning(semiList.first().pos, Warnings.ExtraneousSemicolon);
+                            log.warning(DiagnosticFlag.SYNTAX, semiList.first().pos, Warnings.ExtraneousSemicolon);
                     }
                     ModuleKind kind = ModuleKind.STRONG;
                     if (token.name() == names.open) {
@@ -4975,8 +5017,10 @@ public class JavacParser implements Parser {
 
     protected boolean isNonSealedClassStart(boolean local) {
         if (isNonSealedIdentifier(token, 0)) {
-            Token next = S.token(3);
-            return allowedAfterSealedOrNonSealed(next, local, true);
+            if (allowedAfterSealedNonSealedOrValue(3, local)) {
+                checkSourceLevel(Feature.SEALED_CLASSES);
+                return true;
+            }
         }
         return false;
     }
@@ -4988,7 +5032,16 @@ public class JavacParser implements Parser {
             if (someToken.endPos == tokenSub.pos &&
                     tokenSub.endPos == tokenSealed.pos &&
                     tokenSealed.name() == names.sealed) {
-                checkSourceLevel(Feature.SEALED_CLASSES);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    protected boolean isValueModifier(boolean local) {
+        if (token.kind == IDENTIFIER && token.name() == names.value) {
+            if (allowedAfterSealedNonSealedOrValue(1, local)) {
+                checkSourceLevel(Feature.VALUE_CLASSES);
                 return true;
             }
         }
@@ -4997,8 +5050,7 @@ public class JavacParser implements Parser {
 
     protected boolean isSealedClassStart(boolean local) {
         if (token.name() == names.sealed) {
-            Token next = S.token(1);
-            if (allowedAfterSealedOrNonSealed(next, local, false)) {
+            if (allowedAfterSealedNonSealedOrValue(1, local)) {
                 checkSourceLevel(Feature.SEALED_CLASSES);
                 return true;
             }
@@ -5006,25 +5058,46 @@ public class JavacParser implements Parser {
         return false;
     }
 
-    private boolean allowedAfterSealedOrNonSealed(Token next, boolean local, boolean currentIsNonSealed) {
-        return local ?
+    private boolean allowedAfterSealedNonSealedOrValue(int lookahead, boolean local) {
+        while (true) {
+            Token next = S.token(lookahead);
             switch (next.kind) {
                 case MONKEYS_AT -> {
-                    Token afterNext = S.token(2);
-                    yield afterNext.kind != INTERFACE || currentIsNonSealed;
+                    Token afterNext = S.token(lookahead + 1);
+                    if (afterNext.kind == INTERFACE) {
+                        return true;
+                    }
+                    lookahead = skipAnnotation(lookahead) + 1;
                 }
-                case ABSTRACT, FINAL, STRICTFP, CLASS, INTERFACE, ENUM -> true;
-                default -> false;
-            } :
-            switch (next.kind) {
-                case MONKEYS_AT -> {
-                    Token afterNext = S.token(2);
-                    yield afterNext.kind != INTERFACE || currentIsNonSealed;
+                case ABSTRACT, STATIC, FINAL, STRICTFP, CLASS, INTERFACE, ENUM -> {return true;}
+                case PUBLIC, PROTECTED, PRIVATE -> {return !local;}
+                case VOID, BOOLEAN, BYTE, SHORT, CHAR, INT, LONG, FLOAT, DOUBLE -> {return true;}
+                case IDENTIFIER -> {
+                    if (next.name() == names.record && S.token(lookahead + 1).kind == IDENTIFIER) {
+                        return true;
+                    } else if (isNonSealedIdentifier(next, lookahead)) {
+                        lookahead += 3;
+                    } else if (next.name() == names.sealed ||
+                        next.name() == names.value) {
+                        lookahead++;
+                    } else {
+                        switch (S.token(lookahead + 1).kind) {
+                            case IDENTIFIER, DOT, LT -> {
+                                return true;
+                            }
+                            case MONKEYS_AT -> {
+                                //continue search
+                                lookahead++;
+                            }
+                            default -> {
+                                return false;
+                            }
+                        }
+                    }
                 }
-                case PUBLIC, PROTECTED, PRIVATE, ABSTRACT, STATIC, FINAL, STRICTFP, CLASS, INTERFACE, ENUM -> true;
-                case IDENTIFIER -> isNonSealedIdentifier(next, currentIsNonSealed ? 3 : 1) || next.name() == names.sealed;
-                default -> false;
+                default -> {return false;}
             };
+        }
     }
 
     /** MethodDeclaratorRest =
@@ -5616,7 +5689,7 @@ public class JavacParser implements Parser {
             log.error(pos, feature.error(source.name));
         } else if (preview.isPreview(feature)) {
             //use of preview feature, warn
-            preview.warnPreview(pos, feature);
+            preview.warnPreview(DiagnosticFlag.SYNTAX, pos, feature);
         }
     }
 

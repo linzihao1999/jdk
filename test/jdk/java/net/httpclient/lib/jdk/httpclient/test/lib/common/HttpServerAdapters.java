@@ -75,6 +75,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.function.Supplier;
 import java.util.function.Predicate;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
@@ -319,6 +320,7 @@ public interface HttpServerAdapters {
         public abstract InetSocketAddress getLocalAddress();
         public abstract String getConnectionKey();
         public abstract SSLSession getSSLSession();
+        public abstract <T> T getUnderlyingExchange(Class<T> exchgType);
         public CompletableFuture<Long> sendPing() {
             throw new UnsupportedOperationException("sendPing not supported on "
                     + getExchangeVersion());
@@ -473,6 +475,9 @@ public interface HttpServerAdapters {
                 throws InterruptedException {
             throw new UnsupportedOperationException("waitForMaxPushId with " + getExchangeVersion());
         }
+        public void setHttp3CancelPushListener(Consumer<Long> listener) {
+            throw new UnsupportedOperationException("setHttp3CancelPushListener with " + getExchangeVersion());
+        }
         public boolean serverPushAllowed() {
             return false;
         }
@@ -552,6 +557,16 @@ public interface HttpServerAdapters {
             @Override
             public String getConnectionKey() {
                 return exchange.getLocalAddress() + "->" + exchange.getRemoteAddress();
+            }
+
+            @Override
+            public <T> T getUnderlyingExchange(final Class<T> exchgType) {
+                if (exchgType.isInstance(this.exchange)) {
+                    return exchgType.cast(this.exchange);
+                }
+                throw new IllegalArgumentException("underlying exchange "
+                        + this.exchange.getClass().getName() + " is not of type: "
+                        + exchgType);
             }
 
             @Override
@@ -640,6 +655,10 @@ public interface HttpServerAdapters {
                 return exchange.waitForMaxPushId(pushId);
             }
             @Override
+            public void setHttp3CancelPushListener(Consumer<Long> listener) {
+                exchange.setCancelPushListener(listener);
+            }
+            @Override
             public Encoder qpackEncoder() {
                 return exchange.qpackEncoder();
             }
@@ -675,6 +694,17 @@ public interface HttpServerAdapters {
             public URI getRequestURI() { return exchange.getRequestURI(); }
             @Override
             public String getRequestMethod() { return exchange.getRequestMethod(); }
+
+            @Override
+            public <T> T getUnderlyingExchange(final Class<T> exchgType) {
+                if (exchgType.isInstance(this.exchange)) {
+                    return exchgType.cast(this.exchange);
+                }
+                throw new IllegalArgumentException("underlying exchange "
+                        + this.exchange.getClass().getName() + " is not of type: "
+                        + exchgType);
+            }
+
             @Override
             public String toString() {
                 return this.getClass().getSimpleName() + ": " + exchange.toString();

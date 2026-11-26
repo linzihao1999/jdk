@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1996, 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1996, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -70,8 +70,10 @@ static LPCTSTR OpenFileNameProp = TEXT("AWT_OFN");
 void
 AwtFileDialog::Initialize(JNIEnv *env, jstring filterDescription)
 {
+#ifdef DEBUG
     int length = env->GetStringLength(filterDescription);
     DASSERT(length + 1 < MAX_FILTER_STRING);
+#endif
     LPCTSTR tmp = JNU_GetStringPlatformChars(env, filterDescription, NULL);
     _tcscpy_s(s_fileFilterString, MAX_FILTER_STRING, tmp);
     JNU_ReleaseStringPlatformChars(env, filterDescription, tmp);
@@ -111,9 +113,7 @@ LRESULT CALLBACK FileDialogWndProc(HWND hWnd, UINT message,
             return 0;
         }
     }
-
-    WNDPROC lpfnWndProc = (WNDPROC)(::GetProp(hWnd, NativeDialogWndProcProp));
-    return ComCtl32Util::GetInstance().DefWindowProc(lpfnWndProc, hWnd, message, wParam, lParam);
+    return ComCtl32Util::GetInstance().DefWindowProc(hWnd, message, wParam, lParam);
 }
 
 static UINT_PTR CALLBACK
@@ -152,10 +152,7 @@ FileDialogHookProc(HWND hdlg, UINT uiMsg, WPARAM wParam, LPARAM lParam)
             }
 
             // subclass dialog's parent to receive additional messages
-            WNDPROC lpfnWndProc = ComCtl32Util::GetInstance().SubclassHWND(parent,
-                                                                           FileDialogWndProc);
-            ::SetProp(parent, NativeDialogWndProcProp, reinterpret_cast<HANDLE>(lpfnWndProc));
-
+            ComCtl32Util::GetInstance().SubclassHWND(parent, FileDialogWndProc);
             ::SetProp(parent, OpenFileNameProp, (void *)lParam);
 
             break;
@@ -167,12 +164,8 @@ FileDialogHookProc(HWND hdlg, UINT uiMsg, WPARAM wParam, LPARAM lParam)
                 ::ImmReleaseContext(hdlg, hIMC);
             }
 
-            WNDPROC lpfnWndProc = (WNDPROC)(::GetProp(parent, NativeDialogWndProcProp));
-            ComCtl32Util::GetInstance().UnsubclassHWND(parent,
-                                                       FileDialogWndProc,
-                                                       lpfnWndProc);
+            ComCtl32Util::GetInstance().UnsubclassHWND(parent, FileDialogWndProc);
             ::RemoveProp(parent, ModalDialogPeerProp);
-            ::RemoveProp(parent, NativeDialogWndProcProp);
             ::RemoveProp(parent, OpenFileNameProp);
             break;
         }
@@ -242,7 +235,6 @@ AwtFileDialog::Show(void *p)
 {
     JNIEnv *env = (JNIEnv *)JNU_GetEnv(jvm, JNI_VERSION_1_2);
     jobject peer;
-    LPTSTR fileBuffer = NULL;
     LPTSTR currentDirectory = NULL;
     jint mode = 0;
     BOOL result = FALSE;
@@ -270,7 +262,6 @@ AwtFileDialog::Show(void *p)
         }
 //      DASSERT(awtParent);
         title = (jstring)(env)->GetObjectField(target, AwtDialog::titleID);
-        HWND hwndOwner = awtParent ? awtParent->GetHWnd() : NULL;
 
         if (title == NULL || env->GetStringLength(title)==0) {
             title = JNU_NewStringPlatform(env, L" ");
@@ -560,7 +551,7 @@ Java_sun_awt_windows_WFileDialogPeer_setFilterString(JNIEnv *env, jclass cls,
     CATCH_BAD_ALLOC;
 }
 
-JNIEXPORT void JNICALL
+JNIEXPORT jboolean JNICALL
 Java_sun_awt_windows_WFileDialogPeer__1show(JNIEnv *env, jobject peer)
 {
     TRY;
@@ -574,9 +565,12 @@ Java_sun_awt_windows_WFileDialogPeer__1show(JNIEnv *env, jobject peer)
     if (!AwtToolkit::GetInstance().PostMessage(WM_AWT_INVOKE_METHOD,
                              (WPARAM)AwtFileDialog::Show, (LPARAM)peerGlobal)) {
         env->DeleteGlobalRef(peerGlobal);
+        return false;
     }
 
-    CATCH_BAD_ALLOC;
+    return true;
+
+    CATCH_BAD_ALLOC_RET(false);
 }
 
 JNIEXPORT void JNICALL

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -39,7 +39,6 @@ class StoredEdge : public Edge {
   size_t _skip_length;
 
  public:
-  StoredEdge();
   StoredEdge(const Edge* parent, UnifiedOopRef reference);
   StoredEdge(const Edge& edge);
   StoredEdge(const StoredEdge& edge);
@@ -68,7 +67,6 @@ class EdgeStore : public CHeapObj<mtTracing> {
             size_t>
   friend class HashTableHost;
   friend class EventEmitter;
-  friend class ObjectSampleWriter;
   friend class ObjectSampleCheckpoint;
  private:
   static traceid _edge_id_counter;
@@ -106,6 +104,7 @@ class EdgeStore : public CHeapObj<mtTracing> {
   bool is_empty() const;
   traceid get_id(const Edge* edge) const;
   void put_chain(const Edge* chain, size_t length);
+  static traceid allocate_id();
 };
 
 #endif // SHARE_JFR_LEAKPROFILER_CHAINS_EDGESTORE_HPP

@@ -26,6 +26,8 @@
 #include "opto/addnode.hpp"
 #include "opto/connode.hpp"
 #include "opto/convertnode.hpp"
+#include "opto/machnode.hpp"
+#include "opto/matcher.hpp"
 #include "opto/memnode.hpp"
 #include "opto/mulnode.hpp"
 #include "opto/node.hpp"
@@ -455,7 +457,7 @@ const Type* IntegerTypeMultiplication<jlong>::create_type(jlong lo, jlong hi) co
 
 // Compute the product type of two integer ranges into this node.
 const Type* MulINode::mul_ring(const Type* type_left, const Type* type_right) const {
-  const IntegerTypeMultiplication<jint> integer_multiplication(type_left->is_int(), type_right->is_int());
+  const IntegerTypeMultiplication<jint> integer_multiplication(type_left->as_int(), type_right->as_int());
   return integer_multiplication.compute();
 }
 
@@ -466,7 +468,7 @@ bool MulINode::does_overflow(const TypeInt* type_left, const TypeInt* type_right
 
 // Compute the product type of two long ranges into this node.
 const Type* MulLNode::mul_ring(const Type* type_left, const Type* type_right) const {
-  const IntegerTypeMultiplication<jlong> integer_multiplication(type_left->is_long(), type_right->is_long());
+  const IntegerTypeMultiplication<jlong> integer_multiplication(type_left->as_long(), type_right->as_long());
   return integer_multiplication.compute();
 }
 
@@ -632,8 +634,12 @@ const Type* MulHiLNode::Value(PhaseGVN* phase) const {
     return Type::TOP;
   }
 
-  const TypeLong* longType1 = t1->is_long();
-  const TypeLong* longType2 = t2->is_long();
+  if (t1 == Type::BOTTOM || t2 == Type::BOTTOM) {
+    return bottom_type();
+  }
+
+  const TypeLong* longType1 = t1->as_long();
+  const TypeLong* longType2 = t2->as_long();
   return mulhi_value(longType1, longType2, false);
 }
 
@@ -646,9 +652,43 @@ const Type* UMulHiLNode::Value(PhaseGVN* phase) const {
     return Type::TOP;
   }
 
-  const TypeLong* longType1 = t1->is_long();
-  const TypeLong* longType2 = t2->is_long();
+  if (t1 == Type::BOTTOM || t2 == Type::BOTTOM) {
+    return bottom_type();
+  }
+
+  const TypeLong* longType1 = t1->as_long();
+  const TypeLong* longType2 = t2->as_long();
   return mulhi_value(longType1, longType2, true);
+}
+
+MulHiLoLNode* MulHiLoLNode::make(Node* mul_hi) {
+  assert(mul_hi->Opcode() == Op_MulHiL, "expected MulHiL");
+
+  MulHiLoLNode* mul_hi_lo = new MulHiLoLNode(mul_hi->in(0), mul_hi->in(1), mul_hi->in(2));
+  [[maybe_unused]] Node* lo_proj = new ProjNode(mul_hi_lo, MulHiLoLNode::first_proj_num);
+  [[maybe_unused]] Node* hi_proj = new ProjNode(mul_hi_lo, MulHiLoLNode::second_proj_num);
+  return mul_hi_lo;
+}
+
+UMulHiLoLNode* UMulHiLoLNode::make(Node* umul_hi) {
+  assert(umul_hi->Opcode() == Op_UMulHiL, "expected UMulHiL");
+
+  UMulHiLoLNode* umul_hi_lo = new UMulHiLoLNode(umul_hi->in(0), umul_hi->in(1), umul_hi->in(2));
+  [[maybe_unused]] Node* lo_proj = new ProjNode(umul_hi_lo, MulHiLoLNode::first_proj_num);
+  [[maybe_unused]] Node* hi_proj = new ProjNode(umul_hi_lo, MulHiLoLNode::second_proj_num);
+  return umul_hi_lo;
+}
+
+Node* MulHiLoLNode::match(const ProjNode* proj, const Matcher* match) {
+  uint ideal_reg = proj->ideal_reg();
+  RegMask rm;
+  if (proj->_con == first_proj_num) {
+    rm.assignFrom(match->firstL_proj_mask());
+  } else {
+    assert(proj->_con == second_proj_num, "must be lo or hi projection");
+    rm.assignFrom(match->secondL_proj_mask());
+  }
+  return new MachProjNode(this, proj->_con, rm, ideal_reg);
 }
 
 //=============================================================================
@@ -658,7 +698,7 @@ const Type* UMulHiLNode::Value(PhaseGVN* phase) const {
 // This also type-checks the inputs for sanity.  Guaranteed never to
 // be passed a TOP or BOTTOM type, these are filtered out by pre-check.
 const Type* AndINode::mul_ring(const Type* t1, const Type* t2) const {
-  return RangeInference::infer_and(t1->is_int(), t2->is_int());
+  return RangeInference::infer_and(t1->as_int(), t2->as_int());
 }
 
 static bool AndIL_is_zero_element_under_mask(const PhaseGVN* phase, const Node* expr, const Node* mask, BasicType bt);
@@ -681,31 +721,19 @@ Node* AndINode::Identity(PhaseGVN* phase) {
     return in(1);
   }
 
-  Node* in1 = in(1);
-  uint op = in1->Opcode();
-  const TypeInt* t2 = phase->type(in(2))->isa_int();
-  if (t2 && t2->is_con()) {
-    int con = t2->get_con();
-    // Masking off high bits which are always zero is useless.
-    const TypeInt* t1 = phase->type(in(1))->isa_int();
-    if (t1 != nullptr && t1->_lo >= 0) {
-      jint t1_support = right_n_bits(1 + log2i_graceful(t1->_hi));
-      if ((t1_support & con) == t1_support)
-        return in1;
-    }
-    // Masking off the high bits of a unsigned-shift-right is not
-    // needed either.
-    if (op == Op_URShiftI) {
-      const TypeInt* t12 = phase->type(in1->in(2))->isa_int();
-      if (t12 && t12->is_con()) {  // Shift is by a constant
-        int shift = t12->get_con();
-        shift &= BitsPerJavaInteger - 1;  // semantics of Java shifts
-        int mask = max_juint >> shift;
-        if ((mask & con) == mask)  // If AND is useless, skip it
-          return in1;
-      }
-    }
+  const TypeInt* t1 = phase->type(in(1))->as_int();
+  const TypeInt* t2 = phase->type(in(2))->as_int();
+
+  if ((~t1->_bits._ones & ~t2->_bits._zeros) == 0) {
+    // All bits that might be 0 in in1 are known to be 0 in in2
+    return in(2);
   }
+
+  if ((~t2->_bits._ones & ~t1->_bits._zeros) == 0) {
+    // All bits that might be 0 in in2 are known to be 0 in in1
+    return in(1);
+  }
+
   return MulNode::Identity(phase);
 }
 
@@ -788,7 +816,7 @@ Node *AndINode::Ideal(PhaseGVN *phase, bool can_reshape) {
 // This also type-checks the inputs for sanity.  Guaranteed never to
 // be passed a TOP or BOTTOM type, these are filtered out by pre-check.
 const Type* AndLNode::mul_ring(const Type* t1, const Type* t2) const {
-  return RangeInference::infer_and(t1->is_long(), t2->is_long());
+  return RangeInference::infer_and(t1->as_long(), t2->as_long());
 }
 
 const Type* AndLNode::Value(PhaseGVN* phase) const {
@@ -809,32 +837,19 @@ Node* AndLNode::Identity(PhaseGVN* phase) {
     return in(1);
   }
 
-  Node *usr = in(1);
-  const TypeLong *t2 = phase->type( in(2) )->isa_long();
-  if( t2 && t2->is_con() ) {
-    jlong con = t2->get_con();
-    // Masking off high bits which are always zero is useless.
-    const TypeLong* t1 = phase->type( in(1) )->isa_long();
-    if (t1 != nullptr && t1->_lo >= 0) {
-      int bit_count = log2i_graceful(t1->_hi) + 1;
-      jlong t1_support = jlong(max_julong >> (BitsPerJavaLong - bit_count));
-      if ((t1_support & con) == t1_support)
-        return usr;
-    }
-    uint lop = usr->Opcode();
-    // Masking off the high bits of a unsigned-shift-right is not
-    // needed either.
-    if( lop == Op_URShiftL ) {
-      const TypeInt *t12 = phase->type( usr->in(2) )->isa_int();
-      if( t12 && t12->is_con() ) {  // Shift is by a constant
-        int shift = t12->get_con();
-        shift &= BitsPerJavaLong - 1;  // semantics of Java shifts
-        jlong mask = max_julong >> shift;
-        if( (mask&con) == mask )  // If AND is useless, skip it
-          return usr;
-      }
-    }
+  const TypeLong* t1 = phase->type(in(1))->as_long();
+  const TypeLong* t2 = phase->type(in(2))->as_long();
+
+  if ((~t1->_bits._ones & ~t2->_bits._zeros) == 0) {
+    // All bits that might be 0 in in1 are known to be 0 in in2
+    return in(2);
   }
+
+  if ((~t2->_bits._ones & ~t1->_bits._zeros) == 0) {
+    // All bits that might be 0 in in2 are known to be 0 in in1
+    return in(1);
+  }
+
   return MulNode::Identity(phase);
 }
 
@@ -861,13 +876,11 @@ Node *AndLNode::Ideal(PhaseGVN *phase, bool can_reshape) {
   Node* in1 = in(1);
   int op = in1->Opcode();
 
-  // Are we masking a long that was converted from an int with a mask
-  // that fits in 32-bits?  Commute them and use an AndINode.  Don't
-  // convert masks which would cause a sign extension of the integer
-  // value.  This check includes UI2L masks (0x00000000FFFFFFFF) which
-  // would be optimized away later in Identity.
-  if (op == Op_ConvI2L && (mask & UCONST64(0xFFFFFFFF80000000)) == 0) {
-    Node* andi = new AndINode(in1->in(1), phase->intcon(mask));
+  // If the mask is a sign extension of a 32-bit value, commute the AND
+  // with the conversion:
+  //   ConvI2L(x) & mask => ConvI2L(x & (jint)mask)
+  if (op == Op_ConvI2L && mask == (jlong)(jint)mask) {
+    Node* andi = new AndINode(in1->in(1), phase->intcon((jint)mask));
     andi = phase->transform(andi);
     return new ConvI2LNode(andi);
   }
@@ -891,6 +904,38 @@ Node *AndLNode::Ideal(PhaseGVN *phase, bool can_reshape) {
     }
   }
 
+  // Search for GraphKit::mark_word_test patterns and fold the test if the result is statically known
+  if (in1->is_Load() && phase->type(in1)->is_long()) {
+    const TypePtr* adr_t = phase->type(in1->in(MemNode::Address))->isa_ptr();
+    if (adr_t != nullptr && adr_t->offset() == oopDesc::mark_offset_in_bytes()) {
+      if (mask == markWord::value_type_pattern) {
+        if (adr_t->is_valueklassptr()) {
+          set_req_X(1, in(2), phase);
+          return this;
+        } else if (!adr_t->can_be_value_type()) {
+          set_req_X(1, phase->longcon(0), phase);
+          return this;
+        }
+      } else if (mask == markWord::null_free_array_bit_in_place) {
+        if (adr_t->is_null_free()) {
+          set_req_X(1, in(2), phase);
+          return this;
+        } else if (adr_t->is_not_null_free()) {
+          set_req_X(1, phase->longcon(0), phase);
+          return this;
+        }
+      } else if (mask == markWord::flat_array_bit_in_place) {
+        if (adr_t->is_flat()) {
+          set_req_X(1, in(2), phase);
+          return this;
+        } else if (adr_t->is_not_flat()) {
+          set_req_X(1, phase->longcon(0), phase);
+          return this;
+        }
+      }
+    }
+  }
+
   return MulNode::Ideal(phase, can_reshape);
 }
 
@@ -906,53 +951,58 @@ LShiftNode* LShiftNode::make(Node* in1, Node* in2, BasicType bt) {
   return nullptr;
 }
 
-// Returns whether the shift amount is constant. If so, sets count.
-static bool const_shift_count(PhaseGVN* phase, const Node* shift_node, int* count) {
+// Returns whether the shift amount is constant or effectively constant (low bits known).
+//
+// Parameters:
+//   masked_shift - always initialized to 0; if the function returns true, it indicates
+//                  the masked shift amount.
+//   replace      - always initialized to false; if the function returns true, it indicates
+//                  whether the shift_node's shift count input should be replaced with masked_shift.
+static bool mask_shift_amount(PhaseGVN* phase, const Node* shift_node, uint num_bits, uint& masked_shift, bool& replace) {
+  masked_shift = 0;
+  replace = false;
+
   const TypeInt* tcount = phase->type(shift_node->in(2))->isa_int();
-  if (tcount != nullptr && tcount->is_con()) {
-    *count = tcount->get_con();
-    return true;
+
+  if (tcount != nullptr) {
+    uint mask = num_bits - 1;
+    // Canonicalize shift count via type-level masking to expose constants
+    const TypeInt* masked_type = RangeInference::infer_and(tcount, TypeInt::make(mask));
+    if (masked_type != nullptr && masked_type->is_con()) {
+      masked_shift = masked_type->get_con();
+      replace = !tcount->is_con() || (tcount->get_con() != (int)masked_shift);
+      return true;
+    }
   }
   return false;
 }
 
-// Returns whether the shift amount is constant. If so, sets real_shift and masked_shift.
-static bool mask_shift_amount(PhaseGVN* phase, const Node* shift_node, uint nBits, int& real_shift, uint& masked_shift) {
-  if (const_shift_count(phase, shift_node, &real_shift)) {
-    masked_shift = real_shift & (nBits - 1);
-    return true;
-  }
-  return false;
-}
-
-// Convenience for when we don't care about the real amount
-static bool mask_shift_amount(PhaseGVN* phase, const Node* shift_node, uint nBits, uint& masked_shift) {
-  int real_shift;
-  return mask_shift_amount(phase, shift_node, nBits, real_shift, masked_shift);
+// Convenience for when we don't care about the 'replace' output.
+static bool mask_shift_amount(PhaseGVN* phase, const Node* shift_node, uint num_bits, uint& masked_shift) {
+  bool unused;
+  return mask_shift_amount(phase, shift_node, num_bits, masked_shift, unused /*replace*/);
 }
 
 // Use this in ::Ideal only with shiftNode == this!
-// Sets masked_shift to the masked shift amount if constant or 0 if not constant.
+// Sets masked_shift to the effective masked shift amount if constant or 0 if not constant.
 // Returns shift_node if the shift amount input node was modified, nullptr otherwise.
-static Node* mask_and_replace_shift_amount(PhaseGVN* phase, Node* shift_node, uint nBits, uint& masked_shift) {
-  int real_shift;
-  if (mask_shift_amount(phase, shift_node, nBits, real_shift, masked_shift)) {
+static Node* mask_and_replace_shift_amount(PhaseGVN* phase, Node* shift_node, uint num_bits, uint& masked_shift) {
+  if (bool replace; mask_shift_amount(phase, shift_node, num_bits, masked_shift, replace)) {
     if (masked_shift == 0) {
       // Let Identity() handle 0 shift count.
       return nullptr;
     }
 
-    if (real_shift != (int)masked_shift) {
-      shift_node->set_req(2, phase->intcon(masked_shift)); // Replace shift count with masked value.
+    if (replace) {
+      // Replace shift count with masked value and put potential dead nodes on the worklist.
+      shift_node->set_req_X(2, phase->intcon(masked_shift), phase);
 
       // We need to notify the caller that the graph was reshaped, as Ideal needs
       // to return the root of the reshaped graph if any change was made.
       return shift_node;
     }
-  } else {
-    // Not a shift by a constant.
-    masked_shift = 0;
   }
+
   return nullptr;
 }
 
@@ -1006,7 +1056,8 @@ Node* LShiftINode::Identity(PhaseGVN* phase) {
 
 Node* LShiftNode::IdealIL(PhaseGVN* phase, bool can_reshape, BasicType bt) {
   uint con;
-  Node* progress = mask_and_replace_shift_amount(phase, this, bits_per_java_integer(bt), con);
+  uint num_bits = bits_per_java_integer(bt);
+  Node* progress = mask_and_replace_shift_amount(phase, this, num_bits, con);
   if (con == 0) {
     return nullptr;
   }
@@ -1022,7 +1073,7 @@ Node* LShiftNode::IdealIL(PhaseGVN* phase, bool can_reshape, BasicType bt) {
     // and 'i2b' patterns which typically fold into 'StoreC/StoreB'.
     if (bt != T_INT || con < 16) {
       // Left input is an add of the same number?
-      if (con != (bits_per_java_integer(bt) - 1) && add1->in(1) == add1->in(2)) {
+      if (con != (num_bits - 1) && add1->in(1) == add1->in(2)) {
         // Convert "(x + x) << c0" into "x << (c0 + 1)"
         // In general, this optimization cannot be applied for c0 == 31 (for LShiftI) since
         // 2x << 31 != x << 32 = x << 0 = x (e.g. x = 1: 2 << 31 = 0 != 1)
@@ -1060,25 +1111,25 @@ Node* LShiftNode::IdealIL(PhaseGVN* phase, bool can_reshape, BasicType bt) {
 
   // Check for "(x >> C1) << C2"
   if (add1_op == Op_RShift(bt) || add1_op == Op_URShift(bt)) {
-    int add1Con = 0;
-    const_shift_count(phase, add1, &add1Con);
+    uint add1Con;
+    mask_shift_amount(phase, add1, num_bits, add1Con);
 
     // Special case C1 == C2, which just masks off low bits
-    if (add1Con > 0 && con == (uint)add1Con) {
+    if (add1Con > 0 && con == add1Con) {
       // Convert to "(x & -(1 << C2))"
       return  MulNode::make_and(add1->in(1), phase->integercon(java_negate(java_shift_left(1, con, bt), bt), bt), bt);
     } else {
       // Wait until the right shift has been sharpened to the correct count
-      if (add1Con > 0 && (uint)add1Con < bits_per_java_integer(bt)) {
+      if (add1Con > 0) {
         // As loop parsing can produce LShiftI nodes, we should wait until the graph is fully formed
         // to apply optimizations, otherwise we can inadvertently stop vectorization opportunities.
         if (phase->is_IterGVN()) {
-          if (con > (uint)add1Con) {
+          if (con > add1Con) {
             // Creates "(x << (C2 - C1)) & -(1 << C2)"
             Node* lshift = phase->transform(LShiftNode::make(add1->in(1), phase->intcon(con - add1Con), bt));
             return MulNode::make_and(lshift, phase->integercon(java_negate(java_shift_left(1, con, bt), bt), bt), bt);
           } else {
-            assert(con < (uint)add1Con, "must be (%d < %d)", con, add1Con);
+            assert(con < add1Con, "must be (%d < %d)", con, add1Con);
             // Creates "(x >> (C1 - C2)) & -(1 << C2)"
 
             // Handle logical and arithmetic shifts
@@ -1110,9 +1161,8 @@ Node* LShiftNode::IdealIL(PhaseGVN* phase, bool can_reshape, BasicType bt) {
         return MulNode::make_and(add2->in(1), y_sh, bt);
       }
 
-      int add2Con = 0;
-      const_shift_count(phase, add2, &add2Con);
-      if (add2Con > 0 && (uint)add2Con < bits_per_java_integer(bt)) {
+      uint add2Con;
+      if (mask_shift_amount(phase, add2, num_bits, add2Con) && add2Con > 0) {
         if (phase->is_IterGVN()) {
           // Convert to "((x >> C1) << C2) & (Y << C2)"
 
@@ -1129,13 +1179,29 @@ Node* LShiftNode::IdealIL(PhaseGVN* phase, bool can_reshape, BasicType bt) {
     }
   }
 
-  // Check for ((x & ((1<<(32-c0))-1)) << c0) which ANDs off high bits
-  // before shifting them away.
-  const jlong bits_mask = max_unsigned_integer(bt) >> con;
-  assert(bt != T_INT || bits_mask == right_n_bits(bits_per_java_integer(bt)-con), "inconsistent");
-  if (add1_op == Op_And(bt) &&
-      phase->type(add1->in(2)) == TypeInteger::make(bits_mask, bt)) {
-    return LShiftNode::make(add1->in(1), in(2), bt);
+  // (x & mask) << con => x << con, where mask is known to have all bits that
+  // survive the shift set; additional bits are shifted away.
+  const julong bits_mask = max_unsigned_integer(bt) >> con;
+  assert(bt != T_INT || bits_mask == right_n_bits<julong>(num_bits - con), "inconsistent");
+  if (add1_op == Op_And(bt)) {
+    // Either operand of the commutative And can be the mask.
+    for (uint i = 1; i <= 2; i++) {
+      const TypeInteger* mask_t = phase->type(add1->in(i))->isa_integer(bt);
+      if (mask_t == nullptr) {
+        // AND operands have the matching integer type unless they are TOP.
+        // Thus nullptr means TOP here; leave the dead AND for dead-code cleanup.
+        break;
+      }
+      uint64_t known_ones;
+      if (bt == T_INT) {
+        known_ones = mask_t->as_int()->_bits._ones;
+      } else {
+        known_ones = mask_t->as_long()->_bits._ones;
+      }
+      if ((known_ones & bits_mask) == bits_mask) {
+        return LShiftNode::make(add1->in(3 - i), in(2), bt);
+      }
+    }
   }
 
   // Collapse nested left-shifts with constant rhs:
@@ -1173,21 +1239,24 @@ const Type* LShiftNode::ValueIL(PhaseGVN* phase, BasicType bt) const {
     return t1;
   }
 
-  // Either input is BOTTOM ==> the result is BOTTOM
-  if ((t1 == TypeInteger::bottom(bt)) || (t2 == TypeInt::INT) ||
-      (t1 == Type::BOTTOM) || (t2 == Type::BOTTOM)) {
+  // If nothing is known about the shift amount then the result is BOTTOM
+  if (t2 == TypeInt::INT) {
     return TypeInteger::bottom(bt);
   }
 
-  const TypeInteger* r1 = t1->is_integer(bt); // Handy access
-  const TypeInt* r2 = t2->is_int(); // Handy access
+  const TypeInteger* r1 = t1->as_integer(bt); // Handy access
+  // Since the shift semantics in Java take into account only the bottom five
+  // bits for ints and the bottom six bits for longs, we can further constrain
+  // the range of values of the shift amount by ANDing with the right mask based
+  // on whether the type is int or long.
+  const TypeInt* mask = TypeInt::make(bits_per_java_integer(bt) - 1);
+  const TypeInt* r2 = RangeInference::infer_and(t2->as_int(), mask);
 
   if (!r2->is_con()) {
     return TypeInteger::bottom(bt);
   }
 
   uint shift = r2->get_con();
-  shift &= bits_per_java_integer(bt) - 1;  // semantics of Java shifts
   // Shift by a multiple of 32/64 does nothing:
   if (shift == 0) {
     return t1;
@@ -1196,22 +1265,20 @@ const Type* LShiftNode::ValueIL(PhaseGVN* phase, BasicType bt) const {
   // If the shift is a constant, shift the bounds of the type,
   // unless this could lead to an overflow.
   if (!r1->is_con()) {
-    jlong lo = r1->lo_as_long(), hi = r1->hi_as_long();
 #ifdef ASSERT
     if (bt == T_INT) {
-      jint lo_int = r1->is_int()->_lo, hi_int = r1->is_int()->_hi;
+      jlong lo = r1->lo_as_long(), hi = r1->hi_as_long();
+      jint lo_int = r1->as_int()->_lo, hi_int = r1->as_int()->_hi;
       assert((java_shift_right(java_shift_left(lo, shift, bt),  shift, bt) == lo) == (((lo_int << shift) >> shift) == lo_int), "inconsistent");
       assert((java_shift_right(java_shift_left(hi, shift, bt),  shift, bt) == hi) == (((hi_int << shift) >> shift) == hi_int), "inconsistent");
     }
 #endif
-    if (java_shift_right(java_shift_left(lo, shift, bt),  shift, bt) == lo &&
-        java_shift_right(java_shift_left(hi, shift, bt), shift, bt) == hi) {
-      // No overflow.  The range shifts up cleanly.
-      return TypeInteger::make(java_shift_left(lo, shift, bt),
-                               java_shift_left(hi,  shift, bt),
-                               MAX2(r1->_widen, r2->_widen), bt);
+
+    if (bt == T_INT) {
+      return RangeInference::infer_lshift(r1->as_int(), shift);
     }
-    return TypeInteger::bottom(bt);
+
+    return RangeInference::infer_lshift(r1->as_long(), shift);
   }
 
   return TypeInteger::make(java_shift_left(r1->get_con_as_long(bt), shift, bt), bt);
@@ -1223,8 +1290,8 @@ const Type* LShiftINode::Value(PhaseGVN* phase) const {
 }
 
 Node* LShiftNode::IdentityIL(PhaseGVN* phase, BasicType bt) {
-  int count = 0;
-  if (const_shift_count(phase, this, &count) && (count & (bits_per_java_integer(bt) - 1)) == 0) {
+  uint count;
+  if (mask_shift_amount(phase, this, bits_per_java_integer(bt), count) && count == 0) {
     // Shift by a multiple of 32/64 does nothing
     return in(1);
   }
@@ -1263,24 +1330,23 @@ RShiftNode* RShiftNode::make(Node* in1, Node* in2, BasicType bt) {
 //=============================================================================
 //------------------------------Identity---------------------------------------
 Node* RShiftNode::IdentityIL(PhaseGVN* phase, BasicType bt) {
-  int count = 0;
-  if (const_shift_count(phase, this, &count)) {
-    if ((count & (bits_per_java_integer(bt) - 1)) == 0) {
+  uint count;
+  uint num_bits = bits_per_java_integer(bt);
+  if (mask_shift_amount(phase, this, num_bits, count)) {
+    if (count == 0) {
       // Shift by a multiple of 32/64 does nothing
       return in(1);
     }
     // Check for useless sign-masking
-    int lshift_count = 0;
+    uint lshift_count;
     if (in(1)->Opcode() == Op_LShift(bt) &&
         in(1)->req() == 3 &&
         // Compare shift counts by value, not by node pointer, to also match a not-yet-normalized
         // negative constant (e.g. -1 vs 31)
-        const_shift_count(phase, in(1), &lshift_count)) {
-      count &= bits_per_java_integer(bt) - 1; // semantics of Java shifts
-      lshift_count &= bits_per_java_integer(bt) - 1;
+        mask_shift_amount(phase, in(1), num_bits, lshift_count)) {
       if (count == lshift_count) {
         // Compute masks for which this shifting doesn't change
-        jlong lo = (CONST64(-1) << (bits_per_java_integer(bt) - ((uint)count)-1)); // FFFF8000
+        jlong lo = (CONST64(-1) << (num_bits - count - 1)); // FFFF8000
         jlong hi = ~lo;                                                            // 00007FFF
         const TypeInteger* t11 = phase->type(in(1)->in(1))->isa_integer(bt);
         if (t11 == nullptr) {
@@ -1302,8 +1368,7 @@ Node* RShiftINode::Identity(PhaseGVN* phase) {
 
 Node* RShiftNode::IdealIL(PhaseGVN* phase, bool can_reshape, BasicType bt) {
   // Inputs may be TOP if they are dead.
-  const TypeInteger* t1 = phase->type(in(1))->isa_integer(bt);
-  if (t1 == nullptr) {
+  if (!phase->type(in(1))->is_integer(bt)) {
     return NodeSentinel;        // Left input is an integer
   }
 
@@ -1411,8 +1476,8 @@ const Type* RShiftNode::ValueIL(PhaseGVN* phase, BasicType bt) const {
     return TypeInteger::bottom(bt);
   }
 
-  const TypeInteger* r1 = t1->isa_integer(bt);
-  const TypeInt* r2 = t2->isa_int();
+  const TypeInteger* r1 = t1->as_integer(bt);
+  const TypeInt* r2 = t2->as_int();
 
   // If the shift is a constant, just shift the bounds of the type.
   // For example, if the shift is 31/63, we just propagate sign bits.
@@ -1506,8 +1571,8 @@ URShiftNode* URShiftNode::make(Node* in1, Node* in2, BasicType bt) {
 //=============================================================================
 //------------------------------Identity---------------------------------------
 Node* URShiftINode::Identity(PhaseGVN* phase) {
-  int count = 0;
-  if (const_shift_count(phase, this, &count) && (count & (BitsPerJavaInteger - 1)) == 0) {
+  uint count;
+  if (mask_shift_amount(phase, this, BitsPerJavaInteger, count) && count == 0) {
     // Shift by a multiple of 32 does nothing
     return in(1);
   }
@@ -1576,10 +1641,10 @@ Node* URShiftINode::Ideal(PhaseGVN* phase, bool can_reshape) {
     }
     // Compare shift counts by value, not by node pointer, to also match a not-yet-normalized
     // negative constant (e.g. -1 vs 31)
-    int lshl_con = 0;
+    uint lshl_con;
     if (lshl->Opcode() == Op_LShiftI &&
-        const_shift_count(phase, lshl, &lshl_con) &&
-        (lshl_con & (BitsPerJavaInteger - 1)) == con) {
+        mask_shift_amount(phase, lshl, BitsPerJavaInteger, lshl_con) &&
+        lshl_con == con) {
       Node *y_z = phase->transform(new URShiftINode(y, in(2)));
       Node *sum = phase->transform(new AddINode(lshl->in(1), y_z));
       return new AndINode(sum, phase->intcon(mask));
@@ -1608,10 +1673,10 @@ Node* URShiftINode::Ideal(PhaseGVN* phase, bool can_reshape) {
   Node *shl = in(1);
   // Compare shift counts by value, not by node pointer, to also match a not-yet-normalized
   // negative constant (e.g. -1 vs 31)
-  int shl_con = 0;
+  uint shl_con;
   if (in1_op == Op_LShiftI &&
-      const_shift_count(phase, shl, &shl_con) &&
-      (shl_con & (BitsPerJavaInteger - 1)) == con)
+      mask_shift_amount(phase, shl, BitsPerJavaInteger, shl_con) &&
+      shl_con == con)
     return new AndINode(shl->in(1), phase->intcon(mask));
 
   // Check for (x >> n) >>> 31. Replace with (x >>> 31)
@@ -1620,9 +1685,9 @@ Node* URShiftINode::Ideal(PhaseGVN* phase, bool can_reshape) {
   if ( in1_op == Op_RShiftI ) {
     Node *in11 = shr->in(1);
     Node *in12 = shr->in(2);
-    const TypeInt *t11 = phase->type(in11)->isa_int();
-    const TypeInt *t12 = phase->type(in12)->isa_int();
-    if ( t11 && t2 && t2->is_con(31) && t12 && t12->is_con() ) {
+    bool in11_is_int = phase->type(in11)->is_int();
+    const TypeInt* t12 = phase->type(in12)->isa_int();
+    if (in11_is_int && t2 != nullptr && t2->is_con(31) && t12 != nullptr && t12->is_con()) {
       return new URShiftINode(in11, phase->intcon(31));
     }
   }
@@ -1652,8 +1717,8 @@ const Type* URShiftINode::Value(PhaseGVN* phase) const {
   if (t2 == TypeInt::INT)
     return TypeInt::INT;
 
-  const TypeInt *r1 = t1->is_int();     // Handy access
-  const TypeInt *r2 = t2->is_int();     // Handy access
+  const TypeInt* r1 = t1->as_int();  // Handy access
+  const TypeInt* r2 = t2->as_int();  // Handy access
 
   if (r2->is_con()) {
     uint shift = r2->get_con();
@@ -1691,12 +1756,12 @@ const Type* URShiftINode::Value(PhaseGVN* phase) const {
   //
   // else if( t1->base() == Type::InstPtr ) {
   //
-  //   const TypeInstPtr *o = t1->is_instptr();
+  //   const TypeInstPtr* o = t1->as_instptr();
   //   if( t1->singleton() )
   //     return TypeInt::make( ((uint32_t)o->const_oop() + o->_offset) >> shift );
   // }
   // else if( t1->base() == Type::KlassPtr ) {
-  //   const TypeKlassPtr *o = t1->is_klassptr();
+  //   const TypeKlassPtr* o = t1->as_klassptr();
   //   if( t1->singleton() )
   //     return TypeInt::make( ((uint32_t)o->const_oop() + o->_offset) >> shift );
   // }
@@ -1707,8 +1772,8 @@ const Type* URShiftINode::Value(PhaseGVN* phase) const {
 //=============================================================================
 //------------------------------Identity---------------------------------------
 Node* URShiftLNode::Identity(PhaseGVN* phase) {
-  int count = 0;
-  if (const_shift_count(phase, this, &count) && (count & (BitsPerJavaLong - 1)) == 0) {
+  uint count;
+  if (mask_shift_amount(phase, this, BitsPerJavaLong, count) && count == 0) {
     // Shift by a multiple of 64 does nothing
     return in(1);
   }
@@ -1741,10 +1806,10 @@ Node* URShiftLNode::Ideal(PhaseGVN* phase, bool can_reshape) {
     }
     // Compare shift counts by value, not by node pointer, to also match a not-yet-normalized
     // negative constant (e.g. -1 vs 63)
-    int lshl_con = 0;
+    uint lshl_con;
     if (lshl->Opcode() == Op_LShiftL &&
-        const_shift_count(phase, lshl, &lshl_con) &&
-        (lshl_con & (BitsPerJavaLong - 1)) == con) {
+        mask_shift_amount(phase, lshl, BitsPerJavaLong, lshl_con) &&
+        lshl_con == con) {
       Node* y_z = phase->transform(new URShiftLNode(y, in(2)));
       Node* sum = phase->transform(new AddLNode(lshl->in(1), y_z));
       return new AndLNode(sum, phase->longcon(mask));
@@ -1769,10 +1834,10 @@ Node* URShiftLNode::Ideal(PhaseGVN* phase, bool can_reshape) {
   Node *shl = in(1);
   // Compare shift counts by value, not by node pointer, to also match a not-yet-normalized
   // negative constant (e.g. -1 vs 63)
-  int shl_con = 0;
+  uint shl_con;
   if (shl->Opcode() == Op_LShiftL &&
-      const_shift_count(phase, shl, &shl_con) &&
-      (shl_con & (BitsPerJavaLong - 1)) == con) {
+      mask_shift_amount(phase, shl, BitsPerJavaLong, shl_con) &&
+      shl_con == con) {
     return new AndLNode(shl->in(1), phase->longcon(mask));
   }
 
@@ -1781,9 +1846,9 @@ Node* URShiftLNode::Ideal(PhaseGVN* phase, bool can_reshape) {
   if ( shr->Opcode() == Op_RShiftL ) {
     Node *in11 = shr->in(1);
     Node *in12 = shr->in(2);
-    const TypeLong *t11 = phase->type(in11)->isa_long();
-    const TypeInt *t12 = phase->type(in12)->isa_int();
-    if ( t11 && t2 && t2->is_con(63) && t12 && t12->is_con() ) {
+    bool in11_is_long = phase->type(in11)->is_long();
+    const TypeInt* t12 = phase->type(in12)->isa_int();
+    if (in11_is_long && t2 != nullptr && t2->is_con(63) && t12 != nullptr && t12->is_con()) {
       return new URShiftLNode(in11, phase->intcon(63));
     }
   }
@@ -1813,8 +1878,8 @@ const Type* URShiftLNode::Value(PhaseGVN* phase) const {
   if (t2 == TypeInt::INT)
     return TypeLong::LONG;
 
-  const TypeLong *r1 = t1->is_long(); // Handy access
-  const TypeInt  *r2 = t2->is_int (); // Handy access
+  const TypeLong* r1 = t1->as_long(); // Handy access
+  const TypeInt* r2 = t2->as_int(); // Handy access
 
   if (r2->is_con()) {
     uint shift = r2->get_con();
@@ -1947,10 +2012,10 @@ Node* RotateLeftNode::Identity(PhaseGVN* phase) {
   if (t1 == Type::TOP) {
     return this;
   }
-  int count = 0;
-  assert(t1->isa_int() || t1->isa_long(), "Unexpected type");
-  int mask = (t1->isa_int() ? BitsPerJavaInteger : BitsPerJavaLong) - 1;
-  if (const_shift_count(phase, this, &count) && (count & mask) == 0) {
+  uint count;
+  assert(t1->is_int() || t1->is_long(), "Unexpected type");
+  uint num_bits = t1->is_int() ? BitsPerJavaInteger : BitsPerJavaLong;
+  if (mask_shift_amount(phase, this, num_bits, count) && count == 0) {
     // Rotate by a multiple of 32/64 does nothing
     return in(1);
   }
@@ -1965,9 +2030,9 @@ const Type* RotateLeftNode::Value(PhaseGVN* phase) const {
     return Type::TOP;
   }
 
-  if (t1->isa_int()) {
-    const TypeInt* r1 = t1->is_int();
-    const TypeInt* r2 = t2->is_int();
+  if (t1->is_int()) {
+    const TypeInt* r1 = t1->as_int();
+    const TypeInt* r2 = t2->as_int();
 
     // Left input is ZERO ==> the result is ZERO.
     if (r1 == TypeInt::ZERO) {
@@ -1984,9 +2049,9 @@ const Type* RotateLeftNode::Value(PhaseGVN* phase) const {
     }
     return TypeInt::INT;
   } else {
-    assert(t1->isa_long(), "Type must be a long");
-    const TypeLong* r1 = t1->is_long();
-    const TypeInt*  r2 = t2->is_int();
+    assert(t1->is_long(), "Type must be a long");
+    const TypeLong* r1 = t1->as_long();
+    const TypeInt*  r2 = t2->as_int();
 
     // Left input is ZERO ==> the result is ZERO.
     if (r1 == TypeLong::ZERO) {
@@ -2008,13 +2073,13 @@ const Type* RotateLeftNode::Value(PhaseGVN* phase) const {
 Node* RotateLeftNode::Ideal(PhaseGVN *phase, bool can_reshape) {
   const Type* t1 = phase->type(in(1));
   const Type* t2 = phase->type(in(2));
-  if (t2->isa_int() && t2->is_int()->is_con()) {
-    if (t1->isa_int()) {
-      int lshift = t2->is_int()->get_con() & 31;
+  if (t2->is_int() && t2->as_int()->is_con()) {
+    if (t1->is_int()) {
+      int lshift = t2->as_int()->get_con() & 31;
       return new RotateRightNode(in(1), phase->intcon(32 - (lshift & 31)), TypeInt::INT);
     } else if (t1 != Type::TOP) {
-      assert(t1->isa_long(), "Type must be a long");
-      int lshift = t2->is_int()->get_con() & 63;
+      assert(t1->is_long(), "Type must be a long");
+      int lshift = t2->as_int()->get_con() & 63;
       return new RotateRightNode(in(1), phase->intcon(64 - (lshift & 63)), TypeLong::LONG);
     }
   }
@@ -2026,10 +2091,10 @@ Node* RotateRightNode::Identity(PhaseGVN* phase) {
   if (t1 == Type::TOP) {
     return this;
   }
-  int count = 0;
-  assert(t1->isa_int() || t1->isa_long(), "Unexpected type");
-  int mask = (t1->isa_int() ? BitsPerJavaInteger : BitsPerJavaLong) - 1;
-  if (const_shift_count(phase, this, &count) && (count & mask) == 0) {
+  uint count;
+  assert(t1->is_int() || t1->is_long(), "Unexpected type");
+  uint num_bits = t1->is_int() ? BitsPerJavaInteger : BitsPerJavaLong;
+  if (mask_shift_amount(phase, this, num_bits, count) && count == 0) {
     // Rotate by a multiple of 32/64 does nothing
     return in(1);
   }
@@ -2044,9 +2109,9 @@ const Type* RotateRightNode::Value(PhaseGVN* phase) const {
     return Type::TOP;
   }
 
-  if (t1->isa_int()) {
-    const TypeInt* r1 = t1->is_int();
-    const TypeInt* r2 = t2->is_int();
+  if (t1->is_int()) {
+    const TypeInt* r1 = t1->as_int();
+    const TypeInt* r2 = t2->as_int();
 
     // Left input is ZERO ==> the result is ZERO.
     if (r1 == TypeInt::ZERO) {
@@ -2063,9 +2128,8 @@ const Type* RotateRightNode::Value(PhaseGVN* phase) const {
     }
     return TypeInt::INT;
   } else {
-    assert(t1->isa_long(), "Type must be a long");
-    const TypeLong* r1 = t1->is_long();
-    const TypeInt*  r2 = t2->is_int();
+    const TypeLong* r1 = t1->as_long();
+    const TypeInt*  r2 = t2->as_int();
     // Left input is ZERO ==> the result is ZERO.
     if (r1 == TypeLong::ZERO) {
       return TypeLong::ZERO;
